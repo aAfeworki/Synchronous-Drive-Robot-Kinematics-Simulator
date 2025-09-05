@@ -1,0 +1,203 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, Button, CheckButtons
+from matplotlib.patches import Circle, Polygon
+
+# ---------------------------
+# Synchronous Drive Simulator
+# ---------------------------
+
+# Parameters
+r = 0.05     # wheel radius [m]
+Ts = 0.05    # integration timestep [s]
+
+# Visual geometry
+body_radius = 0.40
+wheel_len = 0.14
+wheel_wid = 0.05
+
+# Initial state
+X, Y, gamma = 0.0, 0.0, 0.0   # pos, heading
+V = 0.0                       # velocity
+
+# Path trace
+path_x, path_y = [X], [Y]
+
+# Prevent recursive slider updates
+_updating = {"flag": False}
+_running = {"flag": True}
+timer = None
+
+# ---------------------------
+# Geometry helpers
+# ---------------------------
+def rot2d(theta):
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s], [s, c]])
+
+def rect_polygon(cx, cy, length, width, heading):
+    """Return rectangle vertices centered at (cx, cy) rotated by heading."""
+    half_l, half_w = length/2, width/2
+    corners_local = np.array([
+        [ half_l,  half_w],
+        [ half_l, -half_w],
+        [-half_l, -half_w],
+        [-half_l,  half_w],
+    ])
+    Rm = rot2d(heading)
+    pts = (Rm @ corners_local.T).T + np.array([cx, cy])
+    return pts
+
+# ---------------------------
+# Matplotlib figure & artists
+# ---------------------------
+plt.close("all")
+fig = plt.figure(figsize=(10, 7))
+ax = fig.add_axes([0.06, 0.08, 0.66, 0.88])
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlim(-3, 3)
+ax.set_ylim(-3, 3)
+ax.grid(True, alpha=0.3)
+ax.set_title("Synchronous Drive Forward Kinematics")
+
+# Path line
+path_line, = ax.plot(path_x, path_y, lw=1.5, alpha=0.8)
+
+# Body circle
+body_circle = Circle((X, Y), radius=body_radius,
+                     facecolor=(0.2, 0.5, 1.0, 0.25), edgecolor="k", lw=1.5)
+ax.add_patch(body_circle)
+
+# Wheel positions: 3 wheels equally spaced around circle
+wheel_angles = [0, 2*np.pi/3, 4*np.pi/3]
+wheels = []
+for _ in wheel_angles:
+    poly = Polygon(rect_polygon(X, Y, wheel_len, wheel_wid, gamma),
+                   closed=True, facecolor=(0.1, 0.1, 0.1, 0.9),
+                   edgecolor="k", lw=1.0)
+    ax.add_patch(poly)
+    wheels.append(poly)
+
+# Info box
+infotxt = ax.text(0.99, 0.98, "", transform=ax.transAxes,
+                  ha="right", va="top",
+                  bbox=dict(boxstyle="round", facecolor="white", alpha=0.9, lw=0.8),
+                  family="monospace", fontsize=9)
+
+# ---------------------------
+# Update visuals
+# ---------------------------
+def update_robot_artist():
+    global X, Y, gamma, V
+    # update body (circle does not rotate)
+    body_circle.center = (X, Y)
+    # update wheels
+    for ang, poly in zip(wheel_angles, wheels):
+        # wheel positions are fixed relative to the circle
+        wx = X + body_radius * np.cos(ang)
+        wy = Y + body_radius * np.sin(ang)
+        # wheel heading follows gamma
+        heading = gamma
+        poly.set_xy(rect_polygon(wx, wy, wheel_len, wheel_wid, heading))
+    # update path
+    path_line.set_data(path_x, path_y)
+    # info
+    info = (
+        f"V: {V: .3f} m/s\n"
+        f"γ: {np.rad2deg(gamma): .2f} °\n"
+        f"X: {X: .3f} m\n"
+        f"Y: {Y: .3f} m"
+    )
+    infotxt.set_text(info)
+
+# ---------------------------
+# UI controls
+# ---------------------------
+axcolor = "lightgoldenrodyellow"
+ax_V   = fig.add_axes([0.78, 0.78, 0.18, 0.03], facecolor=axcolor)
+ax_gam = fig.add_axes([0.78, 0.73, 0.18, 0.03], facecolor=axcolor)
+ax_ts  = fig.add_axes([0.78, 0.63, 0.18, 0.03], facecolor=axcolor)
+
+s_V   = Slider(ax_V,   "V [m/s]",     -2.0, 2.0, valinit=V, valstep=0.001)
+s_gam = Slider(ax_gam, "Heading [°]", -180, 180, valinit=np.rad2deg(gamma))
+s_ts  = Slider(ax_ts,  "Ts [s]",       0.01, 0.2, valinit=Ts, valstep=0.005)
+
+ax_btn_run = fig.add_axes([0.78, 0.50, 0.085, 0.05])
+ax_btn_rst = fig.add_axes([0.875, 0.50, 0.085, 0.05])
+btn_run = Button(ax_btn_run, "Run/Pause")
+btn_rst = Button(ax_btn_rst, "Reset")
+
+ax_chk = fig.add_axes([0.78, 0.35, 0.18, 0.10])
+chk = CheckButtons(ax_chk, ["Trace Path"], [True])
+chk_labels = [lbl.get_text() for lbl in chk.labels]
+
+# ---------------------------
+# Callbacks
+# ---------------------------
+def on_V(val):
+    global V
+    V = s_V.val
+
+def on_gamma(val):
+    global gamma
+    gamma = np.deg2rad(s_gam.val)  # convert degrees to radians
+
+def on_ts(val):
+    global Ts, timer
+    Ts = s_ts.val
+    if timer is not None:
+        timer.interval = int(Ts * 1000)
+
+s_V.on_changed(on_V)
+s_gam.on_changed(on_gamma)
+s_ts.on_changed(on_ts)
+
+def toggle_run(event):
+    _running["flag"] = not _running["flag"]
+
+def do_reset(event):
+    global X, Y, gamma, path_x, path_y
+    X, Y, gamma = 0.0, 0.0, 0.0
+    path_x, path_y = [X], [Y]
+    s_gam.set_val(0)  # reset heading slider
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+btn_run.on_clicked(toggle_run)
+btn_rst.on_clicked(do_reset)
+
+def on_check(label):
+    states = dict(zip(chk_labels, chk.get_status()))
+    Trace_path = states.get("Trace Path", True)
+    if not Trace_path:
+        path_x.clear()
+        path_y.clear()
+        path_x.append(X)
+        path_y.append(Y)
+    fig.canvas.draw_idle()
+
+chk.on_clicked(on_check)
+
+# ---------------------------
+# Simulation step
+# ---------------------------
+def step():
+    global X, Y, gamma, V
+    if not _running["flag"]:
+        return
+    # integrate position (gamma is fixed by slider)
+    X += V * Ts * np.cos(gamma)
+    Y += V * Ts * np.sin(gamma)
+    path_x.append(X)
+    path_y.append(Y)
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+# Timer
+timer = fig.canvas.new_timer(interval=int(Ts * 1000))
+timer.add_callback(step)
+timer.start()
+
+# Initial draw
+update_robot_artist()
+plt.show()

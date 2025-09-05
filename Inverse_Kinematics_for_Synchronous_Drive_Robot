@@ -1,0 +1,201 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, CheckButtons
+from matplotlib.patches import Circle, Polygon
+
+# ---------------------------
+# Synchronous Drive IK Simulator
+# ---------------------------
+
+# Parameters
+Ts = 0.05    # integration timestep [s]
+body_radius = 0.40
+wheel_len = 0.14
+wheel_wid = 0.05
+
+# Initial state
+X, Y, gamma = 0.0, 0.0, 0.0   # pos, heading
+V = 0.5                       # nominal forward speed
+
+# Path trace
+path_x, path_y = [X], [Y]
+clicked_points = []
+
+# Flags
+_running = {"flag": True}
+timer = None
+target = None  # target (x,y)
+
+# ---------------------------
+# Geometry helpers
+# ---------------------------
+def rot2d(theta):
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s], [s, c]])
+
+def rect_polygon(cx, cy, length, width, heading):
+    half_l, half_w = length/2, width/2
+    corners_local = np.array([
+        [ half_l,  half_w],
+        [ half_l, -half_w],
+        [-half_l, -half_w],
+        [-half_l,  half_w],
+    ])
+    Rm = rot2d(heading)
+    return (Rm @ corners_local.T).T + np.array([cx, cy])
+
+# ---------------------------
+# Matplotlib figure & artists
+# ---------------------------
+plt.close("all")
+fig = plt.figure(figsize=(10, 7))
+ax = fig.add_axes([0.06, 0.08, 0.66, 0.88])
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlim(-3, 3)
+ax.set_ylim(-3, 3)
+ax.grid(True, alpha=0.3)
+ax.set_title("Synchronous Drive Inverse Kinematics")
+
+# Path line
+path_line, = ax.plot(path_x, path_y, lw=1.5, alpha=0.8)
+
+# Body circle
+body_circle = Circle((X, Y), radius=body_radius,
+                     facecolor=(0.2, 0.5, 1.0, 0.25), edgecolor="k", lw=1.5)
+ax.add_patch(body_circle)
+
+# Wheels (3 wheels at 120°)
+wheel_angles = [0, 2*np.pi/3, 4*np.pi/3]
+wheels = []
+for _ in wheel_angles:
+    poly = Polygon(rect_polygon(X, Y, wheel_len, wheel_wid, gamma),
+                   closed=True, facecolor=(0.1, 0.1, 0.1, 0.9),
+                   edgecolor="k", lw=1.0)
+    ax.add_patch(poly)
+    wheels.append(poly)
+
+# Target markers
+target_scatter = ax.scatter([], [], c="k", s=50, marker="o")
+
+# Info box
+infotxt = ax.text(0.99, 0.98, "", transform=ax.transAxes,
+                  ha="right", va="top",
+                  bbox=dict(boxstyle="round", facecolor="white", alpha=0.9, lw=0.8),
+                  family="monospace", fontsize=9)
+
+# ---------------------------
+# Update visuals
+# ---------------------------
+def update_robot_artist():
+    global X, Y, gamma
+    body_circle.center = (X, Y)
+    # wheels
+    for ang, poly in zip(wheel_angles, wheels):
+        wx = X + body_radius * np.cos(ang)
+        wy = Y + body_radius * np.sin(ang)
+        poly.set_xy(rect_polygon(wx, wy, wheel_len, wheel_wid, gamma))
+    # path
+    path_line.set_data(path_x, path_y)
+    # target
+    if target is not None:
+        target_scatter.set_offsets([target])
+    else:
+        target_scatter.set_offsets(np.empty((0, 2)))
+    # info
+    info = (
+        f"γ: {np.rad2deg(gamma): .2f} °\n"
+        f"X: {X: .3f} m\n"
+        f"Y: {Y: .3f} m"
+    )
+    infotxt.set_text(info)
+
+# ---------------------------
+# UI controls
+# ---------------------------
+ax_btn_run = fig.add_axes([0.78, 0.55, 0.085, 0.05])
+ax_btn_rst = fig.add_axes([0.875, 0.55, 0.085, 0.05])
+btn_run = Button(ax_btn_run, "Run/Pause")
+btn_rst = Button(ax_btn_rst, "Reset")
+
+ax_chk = fig.add_axes([0.78, 0.35, 0.18, 0.10])
+chk = CheckButtons(ax_chk, ["Trace Path"], [True])
+chk_labels = [lbl.get_text() for lbl in chk.labels]
+
+# ---------------------------
+# Callbacks
+# ---------------------------
+def toggle_run(event):
+    _running["flag"] = not _running["flag"]
+
+def do_reset(event):
+    global X, Y, gamma, path_x, path_y, target, clicked_points
+    X, Y, gamma = 0.0, 0.0, 0.0
+    path_x, path_y = [X], [Y]
+    target = None
+    clicked_points.clear()
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+btn_run.on_clicked(toggle_run)
+btn_rst.on_clicked(do_reset)
+
+def on_check(label):
+    states = dict(zip(chk_labels, chk.get_status()))
+    if not states.get("Trace Path", True):
+        path_x.clear()
+        path_y.clear()
+        path_x.append(X)
+        path_y.append(Y)
+        clicked_points.clear()
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+chk.on_clicked(on_check)
+
+def on_click(event):
+    global target, clicked_points
+    if event.inaxes != ax:
+        return
+    target = (event.xdata, event.ydata)
+    clicked_points.append(target)
+    update_robot_artist()
+
+fig.canvas.mpl_connect("button_press_event", on_click)
+
+# ---------------------------
+# Simulation step (IK)
+# ---------------------------
+def step():
+    global X, Y, gamma, target
+    if not _running["flag"] or target is None:
+        return
+
+    tx, ty = target
+    dx, dy = tx - X, ty - Y
+    dist = np.hypot(dx, dy)
+    if dist < 0.05:  # close enough
+        target = None
+        return
+
+    desired_heading = np.arctan2(dy, dx)
+    gamma = desired_heading  # instant heading adjustment
+    X += V * Ts * np.cos(gamma)
+    Y += V * Ts * np.sin(gamma)
+
+    path_x.append(X)
+    path_y.append(Y)
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+# ---------------------------
+# Timer
+# ---------------------------
+timer = fig.canvas.new_timer(interval=int(Ts * 1000))
+timer.add_callback(step)
+timer.start()
+
+# ---------------------------
+# Run
+# ---------------------------
+update_robot_artist()
+plt.show()
